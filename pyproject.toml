@@ -1,0 +1,15 @@
+[project]
+name = "felix"
+version = "0.1.0"
+description = "Personal TIDAL player backend (tidalapi + mpv)"
+requires-python = ">=3.11"
+dependencies = [
+  "tidalapi",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
