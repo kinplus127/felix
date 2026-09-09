@@ -70,6 +70,7 @@ from felix.engine.output import OutputSpec
 from felix.engine.pcm import PcmReading, pcm_mismatch
 from felix.engine.process import ProcessError
 from felix.logs import get_logger, setup_logging
+from felix.runtime.bus import EventBus, Listener
 from felix.runtime.now_playing import NowPlaying
 from felix.runtime.queue import PlayQueue
 from felix.settings import (
@@ -87,7 +88,6 @@ from felix.tidal.auth import AuthError, load
 from felix.tidal.client import CatalogError, Client
 from felix.tidal.streams import StreamError, resolve
 
-Listener = Callable[[Event], None]
 _PREV_RESTART_AFTER = 3.0
 _SEEK_RETRY_DELAY = 0.35
 log = get_logger("app")
@@ -169,7 +169,7 @@ class App:
         self.queue = PlayQueue()
         self.last_error = ""
         self._settings = load_settings()
-        self._listeners: list[Listener] = []
+        self._bus = EventBus()
         self._lock = threading.Lock()
         self._play_lock = threading.Lock()
         self._rehydrating = False
@@ -197,8 +197,12 @@ class App:
             self._settings.exclusive_device or "-",
         )
 
-    def subscribe(self, listener: Listener) -> None:
-        self._listeners.append(listener)
+    def subscribe(self, listener: Listener) -> int:
+        """Listen for events. Keep the token; a UI must unsubscribe on close."""
+        return self._bus.subscribe(listener)
+
+    def unsubscribe(self, token: int) -> bool:
+        return self._bus.unsubscribe(token)
 
     def status(self) -> RuntimeStatus:
         try:
@@ -710,8 +714,7 @@ class App:
         self._emit(QueueUpdated(track_ids, index, history))
 
     def _emit(self, event: Event) -> None:
-        for listener in list(self._listeners):
-            listener(event)
+        self._bus.publish(event)
 
     def _pump_engine(self) -> None:
         while self._running:
@@ -719,7 +722,10 @@ class App:
                 event = self._engine.events.get(timeout=0.2)
             except stdqueue.Empty:
                 continue
-            self._on_engine(event)
+            try:
+                self._on_engine(event)
+            except Exception:
+                log.exception("engine pump failed on %s", event.name)
 
     def _on_engine(self, event: EngineEvent) -> None:
         if self._switching and event.name in {"error", "eof", "playing", "paused", "pcm"}:

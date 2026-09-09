@@ -325,35 +325,41 @@ class Controller:
                 message = ipc.events.get(timeout=0.2)
             except queue.Empty:
                 continue
-            event = message.get("event")
-            if event == "start-file":
-                self._emit("playing")
-            elif event == "end-file":
-                reason = message.get("reason")
-                if reason == "eof":
-                    self._emit("eof")
-                elif reason == "error":
-                    detail = message.get("file_error") or "end-file"
-                    log.error("mpv end-file error: %s", detail)
-                    self._emit("error", detail)
-            elif event == "property-change":
-                name = message.get("name")
-                data = message.get("data")
-                if name == "duration" and data is not None:
-                    self._emit("duration", float(data))
-                elif name == "playback-time" and data is not None:
-                    self._emit("time", float(data))
-                elif name == "pause" and data is True:
-                    self._emit("paused")
-                elif name == "pause" and data is False:
-                    self._emit("resumed")
-                elif name == "eof-reached" and data is True:
-                    self._emit("eof")
-                elif name == "audio-params":
-                    rate, fmt = parse_params(data)
-                    self._pcm = self._pcm.with_decode(rate, fmt)
-                    self._emit("pcm", self._pcm)
-                elif name == "audio-out-params":
-                    rate, fmt = parse_params(data)
-                    self._pcm = self._pcm.with_output(rate, fmt)
-                    self._emit("pcm", self._pcm)
+            try:
+                self._on_message(message)
+            except Exception:
+                log.exception("mpv event pump failed on %s", message.get("event"))
+
+    def _on_message(self, message: dict[str, Any]) -> None:
+        event = message.get("event")
+        if event == "start-file":
+            self._emit("playing")
+        elif event == "end-file":
+            reason = message.get("reason")
+            if reason == "eof":
+                self._emit("eof")
+            elif reason == "error":
+                detail = message.get("file_error") or "end-file"
+                log.error("mpv end-file error: %s", detail)
+                self._emit("error", detail)
+        elif event == "property-change":
+            name = message.get("name")
+            data = message.get("data")
+            if name == "duration" and data is not None:
+                self._emit("duration", float(data))
+            elif name == "playback-time" and data is not None:
+                self._emit("time", float(data))
+            elif name == "pause" and data is True:
+                self._emit("paused")
+            elif name == "pause" and data is False:
+                self._emit("resumed")
+            elif name == "eof-reached" and data is True:
+                self._emit("eof")
+            elif name == "audio-params":
+                rate, fmt = parse_params(data)
+                self._pcm = self._pcm.with_decode(rate, fmt)
+                self._emit("pcm", self._pcm)
+            elif name == "audio-out-params":
+                rate, fmt = parse_params(data)
+                self._pcm = self._pcm.with_output(rate, fmt)
+                self._emit("pcm", self._pcm)
