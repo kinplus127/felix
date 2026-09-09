@@ -13,3 +13,6 @@ MPD_KEEP = 4
 DEFAULT_QUALITY = "max"
 PREFETCH_LEAD_SECS = 18.0
 PREFETCH_TTL_SECS = 75.0
+# How long a track change waits for an in-flight prefetch before resolving
+# itself. Kept short: this blocks the transport worker.
+PREFETCH_WAIT_SECS = 1.5

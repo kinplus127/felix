@@ -11,7 +11,13 @@ from pathlib import Path
 
 import tidalapi
 
-from felix.config import DEFAULT_QUALITY, LOG_PATH, PREFETCH_LEAD_SECS, PREFETCH_TTL_SECS
+from felix.config import (
+    DEFAULT_QUALITY,
+    LOG_PATH,
+    PREFETCH_LEAD_SECS,
+    PREFETCH_TTL_SECS,
+    PREFETCH_WAIT_SECS,
+)
 from felix.domain.events import (
     AlbumOpened,
     ArtistOpened,
@@ -90,20 +96,35 @@ from felix.tidal.streams import StreamError, resolve
 
 _PREV_RESTART_AFTER = 3.0
 _SEEK_RETRY_DELAY = 0.35
+
+# Catalog lookups hit the network. They get their own worker so a slow
+# search can never delay pause / next / volume.
+_CATALOG_INTENTS = (
+    Search,
+    OpenAlbum,
+    OpenArtist,
+    ListPlaylists,
+    OpenPlaylist,
+    PlayPlaylist,
+    ShowLyrics,
+    ShowCredits,
+)
+
 log = get_logger("app")
 
 
 class IntentMailbox:
     """One worker, FIFO. Callers enqueue and return immediately."""
 
-    def __init__(self, apply: Callable[[Intent], None]) -> None:
+    def __init__(
+        self, apply: Callable[[Intent], None], name: str = "felix-intents"
+    ) -> None:
         self._apply = apply
+        self._name = name
         self._queue: stdqueue.Queue[Intent | None] = stdqueue.Queue()
         self._lock = threading.Lock()
         self._closed = False
-        self._thread = threading.Thread(
-            target=self._run, daemon=True, name="felix-intents"
-        )
+        self._thread = threading.Thread(target=self._run, daemon=True, name=name)
         self._thread.start()
 
     def submit(self, intent: Intent) -> bool:
@@ -121,7 +142,7 @@ class IntentMailbox:
             self._queue.put(None)
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
-            log.warning("intent worker still running after close")
+            log.warning("%s still running after close", self._name)
 
     def _run(self) -> None:
         while True:
@@ -182,11 +203,14 @@ class App:
         self._pending_pause = False
         self._switching = False
         self._format: FormatReady | None = None
+        self._latest_search: Search | None = None
+        self._ao_cache: str | None = None
         self._running = True
         self._start_engine()
         self._pump = threading.Thread(target=self._pump_engine, daemon=True)
         self._pump.start()
-        self._mailbox = IntentMailbox(self._apply_intent)
+        self._transport = IntentMailbox(self._apply_intent, name="felix-transport")
+        self._catalog = IntentMailbox(self._apply_intent, name="felix-catalog")
         log.info(
             "app started quality=%s volume=%s output=%s ao=%s device=%s exclusive=%s",
             self._quality,
@@ -205,10 +229,7 @@ class App:
         return self._bus.unsubscribe(token)
 
     def status(self) -> RuntimeStatus:
-        try:
-            ao = self._engine.audio_output()
-        except (IpcError, ProcessError) as exc:
-            ao = f"unavailable ({exc})"
+        ao = self._audio_output()
         with self._lock:
             last_error = self.last_error
             volume = self._settings.volume
@@ -235,8 +256,33 @@ class App:
             pcm_matched=fmt.matched if fmt else None,
         )
 
+    def _audio_output(self) -> str:
+        """Cached: a UI polls status() often and this costs mpv IPC round trips.
+        Only the engine restarting can change it, so that is when we drop it."""
+        with self._lock:
+            cached = self._ao_cache
+        if cached is not None:
+            return cached
+        try:
+            ao = self._engine.audio_output()
+        except (IpcError, ProcessError) as exc:
+            return f"unavailable ({exc})"
+        with self._lock:
+            self._ao_cache = ao
+        return ao
+
+    def _invalidate_audio_output(self) -> None:
+        with self._lock:
+            self._ao_cache = None
+
     def handle(self, intent: Intent) -> None:
-        if not self._mailbox.submit(intent):
+        """Route the intent to the transport or the catalog worker."""
+        if isinstance(intent, Search):
+            with self._lock:
+                self._latest_search = intent
+        catalog = isinstance(intent, _CATALOG_INTENTS)
+        mailbox = self._catalog if catalog else self._transport
+        if not mailbox.submit(intent):
             log.warning("intent ignored after close: %s", type(intent).__name__)
 
     def _apply_intent(self, intent: Intent) -> None:
@@ -270,7 +316,7 @@ class App:
             elif isinstance(intent, Stop):
                 self._stop()
             elif isinstance(intent, Search):
-                self._on_search(intent.query, intent.limit)
+                self._on_search(intent)
             elif isinstance(intent, OpenAlbum):
                 self._on_open_album(intent.album_id)
             elif isinstance(intent, OpenArtist):
@@ -313,6 +359,7 @@ class App:
         )
 
     def _start_engine(self) -> None:
+        self._invalidate_audio_output()
         settings = self._settings
         if settings.output == "exclusive" and not settings.exclusive_device:
             log.warning("exclusive requested without device; starting system")
@@ -399,6 +446,7 @@ class App:
                 self._apply_volume(applied.volume, persist=False)
         finally:
             self._switching = False
+            self._invalidate_audio_output()
         if was_playing and track_id:
             self._pending_pause = was_paused
             if position > 1:
@@ -454,7 +502,9 @@ class App:
         )
 
     def close(self) -> None:
-        self._mailbox.close()
+        # Catalog first: a fetch in flight may still hand playback to transport.
+        self._catalog.close()
+        self._transport.close()
         self._running = False
         self._engine.close()
         self._pump.join(timeout=1)
@@ -527,12 +577,25 @@ class App:
         with self._lock:
             return self.now.state == "loading"
 
-    def _on_search(self, query: str, limit: int) -> None:
-        cleaned = query.strip()
+    def _on_search(self, intent: Search) -> None:
+        cleaned = intent.query.strip()
         if not cleaned:
             self._soft_fail("搜尋字串是空的")
             return
-        self._emit(SearchReady(self._client.search(cleaned, limit=limit)))
+        if self._search_superseded(intent):
+            log.info("search skipped, newer one queued: %s", cleaned)
+            return
+        results = self._client.search(cleaned, limit=intent.limit)
+        if self._search_superseded(intent):
+            log.info("search discarded, newer one queued: %s", cleaned)
+            return
+        self._emit(SearchReady(results))
+
+    def _search_superseded(self, intent: Search) -> bool:
+        """True once a newer Search was submitted, so stale results never
+        overwrite fresher ones in a type-ahead UI."""
+        with self._lock:
+            return self._latest_search is not intent
 
     def _on_open_album(self, album_id: str) -> None:
         album, tracks = self._client.album_tracks(album_id)
@@ -552,7 +615,8 @@ class App:
     def _on_play_playlist(self, playlist_id: str, start_index: int) -> None:
         playlist, tracks = self._client.playlist_tracks(playlist_id)
         self._emit(PlaylistOpened(playlist, tracks))
-        self._on_play_list(tuple(item.id for item in tracks), start_index)
+        # Hand playback back to transport: the catalog worker must not own it.
+        self.handle(PlayList(tuple(item.id for item in tracks), start_index))
 
     def _on_show_lyrics(self, track_id: str) -> None:
         lyrics = self._client.get_lyrics(track_id)
@@ -670,6 +734,7 @@ class App:
 
     def _on_engine_died(self, message: str) -> None:
         self._clear_prefetch()
+        self._invalidate_audio_output()
         with self._lock:
             self.now.state = "stopped"
             self._format = None
@@ -847,7 +912,7 @@ class App:
             self._prefetch_at = None
 
     def _take_prefetch(self, track_id: str) -> PlaybackSource | None:
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + PREFETCH_WAIT_SECS
         while True:
             with self._lock:
                 if self._prefetch_id == track_id and self._prefetch_source is not None:
