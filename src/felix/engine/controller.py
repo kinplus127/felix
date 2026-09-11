@@ -244,10 +244,9 @@ class Controller:
         self._ipc = MpvIpc(self._socket_path)
         self._ipc.command("observe_property", 1, "playback-time")
         self._ipc.command("observe_property", 2, "duration")
-        self._ipc.command("observe_property", 3, "eof-reached")
-        self._ipc.command("observe_property", 4, "pause")
-        self._ipc.command("observe_property", 5, "audio-params")
-        self._ipc.command("observe_property", 6, "audio-out-params")
+        self._ipc.command("observe_property", 3, "pause")
+        self._ipc.command("observe_property", 4, "audio-params")
+        self._ipc.command("observe_property", 5, "audio-out-params")
         self._running = True
         self._dispatch = threading.Thread(target=self._pump, daemon=True)
         self._dispatch.start()
@@ -353,8 +352,6 @@ class Controller:
                 self._emit("paused")
             elif name == "pause" and data is False:
                 self._emit("resumed")
-            elif name == "eof-reached" and data is True:
-                self._emit("eof")
             elif name == "audio-params":
                 rate, fmt = parse_params(data)
                 self._pcm = self._pcm.with_decode(rate, fmt)

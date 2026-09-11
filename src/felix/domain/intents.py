@@ -57,6 +57,13 @@ class Next:
 
 
 @dataclass(frozen=True)
+class ContinueAfterEnd:
+    """Natural eof. Runtime-only; repeat-one replays, otherwise like next."""
+
+    generation: int
+
+
+@dataclass(frozen=True)
 class Prev:
     pass
 
@@ -142,6 +149,7 @@ Intent = (
     | Stop
     | Enqueue
     | Next
+    | ContinueAfterEnd
     | Prev
     | ToggleShuffle
     | CycleRepeat

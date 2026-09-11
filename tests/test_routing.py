@@ -7,6 +7,7 @@ import time
 import unittest
 
 from felix.domain.intents import (
+    ContinueAfterEnd,
     Intent,
     ListPlaylists,
     Next,
@@ -57,6 +58,7 @@ class TestIntentRouting(unittest.TestCase):
             Seek(10.0),
             SetVolume(50.0),
             Stop(),
+            ContinueAfterEnd(1),
         )
         for intent in intents:
             app.handle(intent)

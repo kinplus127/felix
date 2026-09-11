@@ -44,6 +44,7 @@ from felix.domain.events import (
 )
 from felix.domain.intents import (
     AdjustVolume,
+    ContinueAfterEnd,
     CycleRepeat,
     Enqueue,
     Intent,
@@ -205,6 +206,7 @@ class App:
         self._prefetch_inflight: str | None = None
         self._pending_pause = False
         self._switching = False
+        self._play_seq = 0
         self._format: FormatReady | None = None
         self._latest_search: Search | None = None
         self._ao_cache: str | None = None
@@ -298,6 +300,8 @@ class App:
                 self._on_enqueue(intent.track_id)
             elif isinstance(intent, Next):
                 self._on_next()
+            elif isinstance(intent, ContinueAfterEnd):
+                self._on_continue_after_end(intent.generation)
             elif isinstance(intent, Prev):
                 self._on_prev()
             elif isinstance(intent, ToggleShuffle):
@@ -649,6 +653,7 @@ class App:
                 self.now.position = 0.0
                 self.now.duration = None
                 self._format = None
+                self._play_seq += 1
                 if not self._rehydrating:
                     self._pending_seek = None
             track = self._client.get_track(track_id)
@@ -741,6 +746,7 @@ class App:
         with self._lock:
             self.now.state = "stopped"
             self._format = None
+            self._play_seq += 1
         self._remember_error(message)
         self._emit(Failed(message))
         self._emit(Stopped())
@@ -762,12 +768,14 @@ class App:
         with self._lock:
             self.now.state = "stopped"
             self.now.position = 0.0
+            self._play_seq += 1
         self._emit(Stopped())
 
     def _fail(self, message: str) -> None:
         self._clear_prefetch()
         with self._lock:
             self.now.state = "stopped"
+            self._play_seq += 1
         self._remember_error(message)
         self._emit(Failed(message))
 
@@ -994,18 +1002,20 @@ class App:
                 if self._prefetch_inflight == track_id:
                     self._prefetch_inflight = None
 
+    def _on_continue_after_end(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._play_seq:
+                return
+            nxt = self.queue.on_ended()
+        self._emit_queue()
+        if nxt is None:
+            return
+        self._start_track(nxt)
+
     def _on_ended(self) -> None:
         with self._lock:
             self.now.state = "stopped"
+            generation = self._play_seq
         self._emit(Ended())
-        try:
-            with self._lock:
-                nxt = self.queue.on_ended()
-            self._emit_queue()
-            if nxt is None:
-                return
-            self._start_track(nxt)
-        except AuthError as exc:
-            self._fail(str(exc))
-        except (CatalogError, StreamError, IpcError, ProcessError) as exc:
-            self._fail(str(exc))
+        # Hand playback back to transport: the engine pump must not resolve streams.
+        self.handle(ContinueAfterEnd(generation))
