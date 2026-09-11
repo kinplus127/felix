@@ -12,6 +12,7 @@ from felix.config import MPD_DIR, MPD_KEEP
 from felix.domain.models import PlaybackSource, Quality, SourceKind
 from felix.logs import get_logger
 from felix.tidal.auth import raise_if_auth
+from felix.tidal.gate import SessionGate, gate_for
 from felix.tidal.quality import apply_quality
 
 log = get_logger("streams")
@@ -107,6 +108,7 @@ def _resolve_at(
     quality: Quality,
     protect: Path | None = None,
 ) -> PlaybackSource:
+    """Caller must already hold the session gate."""
     apply_quality(session, quality)
     track = session.track(track_id)
     stream = track.get_stream()
@@ -114,48 +116,61 @@ def _resolve_at(
 
 
 def resolve(
-    session: tidalapi.Session,
+    session: tidalapi.Session | SessionGate,
     track_id: str,
     quality: Quality = Quality.MAX,
     protect: Path | None = None,
 ) -> PlaybackSource:
     """Turn a track id into a URL or temporary MPD file. Falls back on failure."""
-    errors: list[str] = []
-    for candidate in _FALLBACK[quality]:
+    gate = gate_for(session)
+    with gate:
+        errors: list[str] = []
         try:
-            source = _resolve_at(session, track_id, candidate, protect=protect)
-        except (
-            StreamNotAvailable,
-            TidalAPIError,
-            StreamError,
-            OSError,
-            ValueError,
-            HTTPError,
-        ) as exc:
-            raise_if_auth(exc)
-            log.warning("resolve fallback track=%s quality=%s: %s", track_id, candidate, exc)
-            errors.append(f"{candidate}: {exc}")
-            continue
-        if candidate != quality:
-            log.warning(
-                "resolved track=%s at %s (wanted %s) kind=%s quality=%s",
-                track_id,
-                candidate,
-                quality,
-                source.kind,
-                source.quality,
-            )
-        else:
-            log.info(
-                "resolved track=%s kind=%s quality=%s bit=%s hz=%s",
-                track_id,
-                source.kind,
-                source.quality,
-                source.bit_depth,
-                source.sample_rate,
-            )
-        return source
+            for candidate in _FALLBACK[quality]:
+                try:
+                    source = _resolve_at(
+                        gate.session, track_id, candidate, protect=protect
+                    )
+                except (
+                    StreamNotAvailable,
+                    TidalAPIError,
+                    StreamError,
+                    OSError,
+                    ValueError,
+                    HTTPError,
+                ) as exc:
+                    raise_if_auth(exc)
+                    log.warning(
+                        "resolve fallback track=%s quality=%s: %s",
+                        track_id,
+                        candidate,
+                        exc,
+                    )
+                    errors.append(f"{candidate}: {exc}")
+                    continue
+                if candidate != quality:
+                    log.warning(
+                        "resolved track=%s at %s (wanted %s) kind=%s quality=%s",
+                        track_id,
+                        candidate,
+                        quality,
+                        source.kind,
+                        source.quality,
+                    )
+                else:
+                    log.info(
+                        "resolved track=%s kind=%s quality=%s bit=%s hz=%s",
+                        track_id,
+                        source.kind,
+                        source.quality,
+                        source.bit_depth,
+                        source.sample_rate,
+                    )
+                return source
 
-    detail = "; ".join(errors) if errors else "unknown"
-    log.error("resolve failed track=%s: %s", track_id, detail)
-    raise StreamError(f"無法取得 {track_id} 的串流（{detail}）")
+            detail = "; ".join(errors) if errors else "unknown"
+            log.error("resolve failed track=%s: %s", track_id, detail)
+            raise StreamError(f"無法取得 {track_id} 的串流（{detail}）")
+        finally:
+            # Fallback may leave session.audio_quality on LOW; put preference back.
+            apply_quality(gate.session, quality)

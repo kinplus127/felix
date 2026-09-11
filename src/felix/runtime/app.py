@@ -92,6 +92,7 @@ from felix.settings import (
 )
 from felix.tidal.auth import AuthError, load
 from felix.tidal.client import CatalogError, Client
+from felix.tidal.gate import gate_for
 from felix.tidal.streams import StreamError, resolve
 
 _PREV_RESTART_AFTER = 3.0
@@ -182,8 +183,10 @@ class App:
         quality: Quality | None = None,
     ) -> None:
         setup_logging()
-        self._session = session if session is not None else load()
-        self._client = Client(self._session)
+        raw_session = session if session is not None else load()
+        self._gate = gate_for(raw_session)
+        self._session = self._gate.session
+        self._client = Client(self._gate)
         self._engine = controller if controller is not None else Controller()
         self._quality = quality if quality is not None else Quality(DEFAULT_QUALITY)
         self.now = NowPlaying()
@@ -654,7 +657,7 @@ class App:
             self._emit(TrackResolved(track))
             log.info("play track=%s title=%s prefetched=%s", track.id, track.title, source is not None)
             if source is None:
-                source = resolve(self._session, track_id, self._quality)
+                source = resolve(self._gate, track_id, self._quality)
             with self._lock:
                 self.now.source = source
             self._emit(SourceReady(source))
@@ -971,7 +974,7 @@ class App:
             protect = Path(current_source.location)
         try:
             source = resolve(
-                self._session, track_id, self._quality, protect=protect
+                self._gate, track_id, self._quality, protect=protect
             )
             with self._lock:
                 if self.queue.peek_next() != track_id:
